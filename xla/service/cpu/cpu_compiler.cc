@@ -55,6 +55,7 @@ limitations under the License.
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Mangler.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Linker/Linker.h"
@@ -70,7 +71,9 @@ limitations under the License.
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/TargetParser/Host.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/SplitModule.h"
+#include "llvm/Transforms/Utils/ValueMapper.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Pass/PassManager.h"
@@ -80,6 +83,7 @@ limitations under the License.
 #include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "xla/backends/cpu/codegen/cpu_features.h"
+#include "xla/backends/cpu/codegen/emitters/cpu_fusion_emitter_config.h"
 #include "xla/backends/cpu/codegen/execution_engine.h"
 #include "xla/backends/cpu/codegen/ir_compiler.h"
 #include "xla/backends/cpu/codegen/jit_compiler.h"
@@ -166,6 +170,7 @@ limitations under the License.
 #include "xla/service/cpu/cpu_options.h"
 #include "xla/service/cpu/dot_op_emitter.h"
 #include "xla/service/cpu/executable.pb.h"
+#include "xla/service/cpu/fusion_wrapper.h"
 #include "xla/service/cpu/ir_emitter.h"
 #include "xla/service/cpu/ir_emitter2.h"
 #include "xla/service/cpu/metrics.h"
@@ -179,6 +184,7 @@ limitations under the License.
 #include "xla/service/executable.h"
 #include "xla/service/float_support.h"
 #include "xla/service/gather_expander.h"
+#include "xla/service/gather_simplifier.h"
 #include "xla/service/hlo.pb.h"
 #include "xla/service/hlo_cost_analysis.h"
 #include "xla/service/hlo_cse.h"
@@ -193,6 +199,7 @@ limitations under the License.
 #include "xla/service/logical_buffer.h"
 #include "xla/service/map_inliner.h"
 #include "xla/service/scatter_expander.h"
+#include "xla/service/scatter_simplifier.h"
 #include "xla/service/select_and_scatter_expander.h"
 #include "xla/service/sharding_propagation.h"
 #include "xla/service/sharding_remover.h"
@@ -441,7 +448,7 @@ void AddHloVerifier(HloPassPipeline* pipeline, HloVerifierOpts&& opts = {},
 }
 
 std::unique_ptr<HloPassFix<HloPassPipeline>> CreateSimplificationPipeline(
-    absl::string_view name, HloModule* module) {
+    absl::string_view name, HloModule* module, bool is_fusion_emitters) {
   // Run the following passes to a fixed point.
   auto pipeline =
       std::make_unique<HloPassFix<HloPassPipeline>>(std::string(name));
@@ -459,6 +466,10 @@ std::unique_ptr<HloPassFix<HloPassPipeline>> CreateSimplificationPipeline(
   pipeline->AddPass<SortSimplifier>();
   pipeline->AddPass<HloDCE>();
   pipeline->AddPass<GatherExpander>(GatherExpander::kEliminateSimpleGathers);
+  if (is_fusion_emitters) {
+    // Conversion to MLIR only works with simplified gathers.
+    pipeline->AddPass<GatherSimplifier>();
+  }
 
   // Needs to happen after algebraic simplifier.
   pipeline->AddPass<TreeReductionRewriter>();
@@ -492,6 +503,11 @@ absl::Status CpuCompiler::RunHloPassesThroughLayoutAssn(
     HloModule* module, bool is_aot_compile,
     TargetMachineFeatures* target_machine_features) {
   const int64_t num_partitions = module->config().num_partitions();
+  const bool is_thunk_runtime =
+      module->config().debug_options().xla_cpu_use_thunk_runtime();
+  const bool is_fusion_emitters =
+      is_thunk_runtime &&
+      module->config().debug_options().xla_cpu_use_fusion_emitters();
   if (num_partitions > 1) {
     if (!module->config().use_spmd_partitioning()) {
       return InvalidArgument(
@@ -575,8 +591,6 @@ absl::Status CpuCompiler::RunHloPassesThroughLayoutAssn(
   // Rewrite to custom calls with target as oneDNN library calls.
 #if defined(INTEL_MKL)
   // AOT compiled code runs in single thread.
-  bool is_thunk_runtime =
-      module->config().debug_options().xla_cpu_use_thunk_runtime();
   if (!is_aot_compile && !is_thunk_runtime) {
     // Placing OneDnnOpsRewriter here to match the flax patterns
     // TODO: Decide where would be the appropriate place for this pass to make
@@ -692,17 +706,25 @@ absl::Status CpuCompiler::RunHloPassesThroughLayoutAssn(
         F16, F32, HloPredicateIsOp<HloOpcode::kDot, HloOpcode::kConvolution>);
   }
 
-  pipeline.AddPass(CreateSimplificationPipeline("simplification", module));
+  pipeline.AddPass(CreateSimplificationPipeline("simplification", module,
+                                                is_fusion_emitters));
 
   // Scatter expander is sandwiched between two simplification pipelines to
   // enable constant folding with the original scatter instructions (which is
   // more efficient than with the expanded version) but then to also ensure that
   // the resulting while loops are simplified.
   pipeline.AddPass<SelectAndScatterExpander>();
-  pipeline.AddPass<ScatterExpander>(ScatterExpander::kEliminateAllScatters);
+  if (is_fusion_emitters) {
+    pipeline.AddPass<ScatterExpander>(
+        ScatterExpander::kEliminateSimpleScatters);
+    pipeline.AddPass<ScatterSimplifier>();
+  }
+  if (!is_fusion_emitters || !kFusionEmitterScatterEnabled) {
+    pipeline.AddPass<ScatterExpander>(ScatterExpander::kEliminateAllScatters);
+  }
 
   pipeline.AddPass(CreateSimplificationPipeline(
-      "post_scatter_expansion_simplification", module));
+      "post_scatter_expansion_simplification", module, is_fusion_emitters));
 
   pipeline.AddPass<BitcastDtypesExpander>();
 
@@ -752,6 +774,10 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
     HloModule* module, bool is_aot_compile,
     TargetMachineFeatures* target_machine_features,
     const CompileOptions& compile_options) {
+  const auto& debug_options = module->config().debug_options();
+  const bool is_thunk_runtime = debug_options.xla_cpu_use_thunk_runtime();
+  const bool is_fusion_emitters =
+      is_thunk_runtime && debug_options.xla_cpu_use_fusion_emitters();
   HloPassPipeline pipeline("HLO passes after layout assignment");
 
   {
@@ -775,12 +801,8 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
           : tsl::port::NumSchedulableCPUs();
 
 #if defined(INTEL_MKL)
-  auto& debug_options = module->config().debug_options();
-  bool is_thunk_runtime = debug_options.xla_cpu_use_thunk_runtime();
-
   // AOT compiled code runs in single thread.
   if (!is_aot_compile && !is_thunk_runtime) {
-    auto debug_options = module->config().debug_options();
     // Run SimplifyFPConversions pass to simplify the BF16 pattern and make it
     // easier to match.
     // Remove `f32 -> bf16 -> f32` casts inserted by bf16 normalization.
@@ -806,6 +828,9 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
 
   // Add a fusion pass now that layout assignment is done.
   pipeline.AddPass<CpuInstructionFusion>();
+  if (is_fusion_emitters) {
+    pipeline.AddPass<FusionWrapper>();
+  }
 
   // The LayoutAssignment pass may leave behind kCopy instructions which are
   // duplicate or NOPs, so remove them with algebraic simplification and CSE.
@@ -850,9 +875,7 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
   pipeline.AddPass<OptimizeInputOutputBufferAlias>(true);
 
   // If enabled we'll use more precise region based analysis for copy removal.
-  if (module->config()
-          .debug_options()
-          .xla_cpu_copy_insertion_use_region_analysis()) {
+  if (debug_options.xla_cpu_copy_insertion_use_region_analysis()) {
     pipeline.AddPass<CopyInsertion>(
         /*can_share_buffer=*/nullptr,
         /*use_region_based_live_range_analysis=*/-1);
@@ -1246,6 +1269,40 @@ static void StripPayloadFromLiteralProto(HloProto& proto) {
   }
 }
 
+static absl::StatusOr<std::unique_ptr<llvm::Module>> ExtractKernels(
+    llvm::Module* original_module,
+    absl::flat_hash_set<llvm::StringRef> kernels) {
+  // Clone into a new module, only keeping definitions of the relevant kernels.
+  auto should_clone_definition = [&kernels](const llvm::GlobalValue* gv) {
+    if (auto* func = llvm::dyn_cast<llvm::Function>(gv)) {
+      return kernels.contains(func->getName());
+    }
+    return false;
+  };
+  llvm::ValueToValueMapTy vmap;
+  std::unique_ptr<llvm::Module> module =
+      llvm::CloneModule(*original_module, vmap, should_clone_definition);
+
+  // Erase the cloned symbols from the original module.
+  for (const auto& kernel_name : kernels) {
+    llvm::Function* to_be_removed = original_module->getFunction(kernel_name);
+    if (to_be_removed == nullptr) {
+      return Internal("Cannot remove kernel %s: cannot be found in module %s",
+                      kernel_name, original_module->getName());
+    }
+    to_be_removed->eraseFromParent();
+  }
+  return module;
+}
+
+static void AddConfigToModule(llvm::Module* module, llvm::StringRef config) {
+  constexpr llvm::StringRef kName = "xla_backend_extra_options";
+  llvm::LLVMContext& context = module->getContext();
+  llvm::MDString* config_string = llvm::MDString::get(context, config);
+  llvm::MDNode* config_node = llvm::MDNode::get(context, {config_string});
+  module->getOrInsertNamedMetadata(kName)->addOperand(config_node);
+}
+
 absl::StatusOr<std::unique_ptr<CpuExecutable>>
 CpuCompiler::CompileCpuExecutable(std::unique_ptr<HloModule> module) {
   TraceMe trace([&] {
@@ -1420,14 +1477,41 @@ CpuCompiler::CompileCpuExecutable(std::unique_ptr<HloModule> module) {
       TF_RETURN_IF_ERROR(VerifyLlvmModule(*module.getModuleUnlocked()));
     }
 
+    // Some kernels have to be compiled separately because they have
+    // extra backend options.
+    int num_extra_functions = 0;
+    using Config = llvm::StringRef;
+    using Kernel = llvm::StringRef;
+    absl::flat_hash_map<Config, absl::flat_hash_set<Kernel>>
+        extra_config_to_kernels;
+    for (const auto& k : ir_emitter2.kernels()) {
+      if (k.backend_extra_options.empty()) continue;
+      auto [_, inserted] =
+          extra_config_to_kernels[k.backend_extra_options].insert(k.name);
+      CHECK(inserted) << "Kernel " << k.name << " is not unique";
+      num_extra_functions++;
+    }
+    const int num_extra_parts = extra_config_to_kernels.size();
+    // We assign one dylib to each set of kernels that have the same config.
+    // This is reasonable because we assume very few kernels will set
+    // extra options, and if they do, the options are likely to be identical.
+    if (num_extra_parts >= parallel_codegen_split_count) {
+      return Internal(
+          "Too many extra compilation parts due to non-default options (%d). "
+          "Consider reducing this number or increasing "
+          "parallel_codegen_split_count (%d)",
+          num_extra_parts, parallel_codegen_split_count);
+    }
+
     // We define the number of module parts based on the total number of
     // compiled functions (kernels and comparators) that are called from thunks,
     // and the maximum number of parts that we want to split the module into.
     size_t num_compiled_functions = ir_emitter2.kernels().size() +
                                     ir_emitter2.comparators().size() +
                                     thunk_emitter.kernels().size();
-    size_t num_parts =
-        std::min(num_compiled_functions, parallel_codegen_split_count);
+    size_t num_default_parts =
+        std::min(num_compiled_functions - num_extra_functions,
+                 parallel_codegen_split_count - num_extra_parts);
 
     // JIT compile the LLVM IR module to in-memory machine code. We split the
     // module into `num_jit_dylibs` parts to allow parallel compilation. In
@@ -1444,35 +1528,54 @@ CpuCompiler::CompileCpuExecutable(std::unique_ptr<HloModule> module) {
             << " kernels and " << ir_emitter2.comparators().size()
             << " comparators";
 
-    if (HasLargeConstants(*llvm_module)) {
-      VLOG(3) << "Skip parallel compilation due to large constants";
-      num_parts = 1;
+    int dylib_index = 0;
+    auto add_jit_module = [&](std::unique_ptr<llvm::Module> llvm_module_part) {
+      // Collect symbols that are compiled in this LLVM module part.
+      RemoveUnusedSymbols(*llvm_module_part);
+      compiled_parts.push_back(
+          CollectCompiledSymbolsPart(ir_emitter2, *llvm_module_part));
+
+      std::string dump = llvm_ir::DumpToString(llvm_module_part.get());
+      VLOG(5) << "Adding compilation module:\n" << dump;
+
+      // Clone LLVM module part into its own thread safe context.
+      auto tsm =
+          CloneAsThreadSafeModule(dylib_index, std::move(llvm_module_part));
+      TF_CHECK_OK(jit_compiler.AddModule(std::move(tsm), dylib_index++));
+    };
+
+    // If there are extra parts, compile them first, since we must
+    // remove the affected kernels from the LLVM module.
+    if (num_extra_parts > 0) {
+      TraceMe trace([&] {
+        return TraceMeEncode("CompileExtraKernels",
+                             {{"num_extra_parts", num_extra_parts}});
+      });
+      for (const auto& [config, kernels] : extra_config_to_kernels) {
+        TF_ASSIGN_OR_RETURN(std::unique_ptr<llvm::Module> new_module,
+                            ExtractKernels(llvm_module.get(), kernels));
+        AddConfigToModule(new_module.get(), config);
+        add_jit_module(std::move(new_module));
+      }
     }
 
-    if (num_parts > 1) {
-      VLOG(3) << "Split LLVM module into " << num_parts
+    if (HasLargeConstants(*llvm_module)) {
+      VLOG(3) << "Skip parallel compilation due to large constants";
+      num_default_parts = 1;
+    }
+
+    if (num_default_parts > 1) {
+      VLOG(3) << "Split LLVM module into " << num_default_parts
               << " parts before codegen to enable parallel compilation"
               << " (max split count: " << parallel_codegen_split_count << ")";
 
       TraceMe trace([&] {
-        return TraceMeEncode("SplitModule", {{"num_parts", num_parts}});
+        return TraceMeEncode("SplitModule",
+                             {{"num_default_parts", num_default_parts}});
       });
 
-      llvm::SplitModule(
-          *llvm_module, num_parts,
-          [&, n = 0](std::unique_ptr<llvm::Module> llvm_module_part) mutable {
-            // Collect symbols that are compiled in this LLVM module part.
-            RemoveUnusedSymbols(*llvm_module_part);
-            compiled_parts.push_back(
-                CollectCompiledSymbolsPart(ir_emitter2, *llvm_module_part));
-
-            // Clone LLVM module part into its own thread safe context.
-            auto tsm = CloneAsThreadSafeModule(n, std::move(llvm_module_part));
-            TF_CHECK_OK(
-                jit_compiler.AddModule(std::move(tsm), /*dylib_index=*/n++));
-          },
-          /*PreserveLocals=*/true, /*RoundRobin=*/true);
-
+      llvm::SplitModule(*llvm_module, num_default_parts, add_jit_module,
+                        /*PreserveLocals=*/true, /*RoundRobin=*/true);
       // Free resources used by the original LLVM module.
       llvm_module.reset();
       llvm_context.reset();
@@ -1494,16 +1597,19 @@ CpuCompiler::CompileCpuExecutable(std::unique_ptr<HloModule> module) {
 
     VLOG(3) << "Adding " << thunk_emitter.kernels().size()
             << " kernels to the JIT compiler";
-    int kernel_dylib_index = 0;
+    // Make sure we use all the "default" modules for maximum parallelism.
+    int num_default_so_far = dylib_index - num_extra_parts;
+    int kernel_dylib_index =
+        num_default_so_far < num_default_parts ? num_default_so_far : 0;
     for (auto& [name, module] : thunk_emitter.kernels()) {
       compiled_symbols.push_back(
           FunctionLibrary::Sym<FunctionLibrary::Kernel>(name));
       symbol_type_id_to_function_type_id.emplace(
           compiled_symbols.back().type_id, SymbolProto::KERNEL);
-      TF_CHECK_OK(
-          jit_compiler.AddModule(std::move(module), kernel_dylib_index));
-      // Simply roundrobin the kernel dylibs
-      kernel_dylib_index = (kernel_dylib_index + 1) % num_parts;
+      TF_CHECK_OK(jit_compiler.AddModule(std::move(module),
+                                         num_extra_parts + kernel_dylib_index));
+      // Simply roundrobin the default kernel dylibs
+      kernel_dylib_index = (kernel_dylib_index + 1) % num_default_parts;
     }
 
     for (const CompiledSymbolsPart& part : compiled_parts) {
@@ -1525,7 +1631,8 @@ CpuCompiler::CompileCpuExecutable(std::unique_ptr<HloModule> module) {
 
     TraceMe trace_codegen([&] {
       return TraceMeEncode(
-          "Codegen", {{"num_parts", num_parts},
+          "Codegen", {{"num_default_parts", num_default_parts},
+                      {"num_extra_parts", num_extra_parts},
                       {"num_compiled_functions", num_compiled_functions}});
     });
 
