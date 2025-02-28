@@ -31,6 +31,7 @@ limitations under the License.
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
@@ -48,6 +49,10 @@ limitations under the License.
 #include "nanobind/stl/unique_ptr.h"  // IWYU pragma: keep
 #include "nanobind/stl/variant.h"  // IWYU pragma: keep
 #include "nanobind/stl/vector.h"  // IWYU pragma: keep
+#include "xla/ffi/api/ffi.h"
+#include "xla/ffi/execution_context.h"
+#include "xla/ffi/ffi_api.h"
+#include "xla/ffi/type_id_registry.h"
 #include "xla/literal.h"
 #include "xla/pjrt/exceptions.h"
 #include "xla/pjrt/mlir_to_hlo.h"
@@ -359,16 +364,45 @@ absl::Status PyClient::Defragment() {
 
 namespace {
 
+std::shared_ptr<xla::ffi::ExecutionContext> MakeFfiContext(
+    std::vector<nb::capsule> host_callbacks) {
+  std::vector<tsl::RCReference<RefCountedCpuCallback>> loaded_host_callbacks;
+  loaded_host_callbacks.reserve(host_callbacks.size());
+  // Extract `ifrt::LoadedHostCallback`s from host callback capsules that were
+  // created by `PyClient::GetEmitPythonCpuCallback()`.
+  for (auto& host_callback : host_callbacks) {
+    auto cb = static_cast<RefCountedCpuCallback*>(host_callback.data());
+    loaded_host_callbacks.push_back(tsl::TakeRef(cb));
+  }
+  auto ffi_context = std::make_shared<xla::ffi::ExecutionContext>();
+  auto type_id =
+      xla::ffi::TypeIdRegistry::TypeId(FfiLoadedHostCallbacks::id.type_id);
+  auto user_data = new FfiLoadedHostCallbacks(std::move(loaded_host_callbacks));
+  CHECK_OK(ffi_context->Insert(
+      type_id, static_cast<void*>(user_data),
+      [](void* ptr) { delete static_cast<FfiLoadedHostCallbacks*>(ptr); }));
+  return ffi_context;
+}
+
 // Makes IFRT `CompileOptions` from XLA `CompileOptions` and optional host
 // callbacks.
 std::unique_ptr<ifrt::CompileOptions> MakeIfrtCompileOptions(
     CompileOptions options, std::vector<nb::capsule> host_callbacks) {
   std::vector<tsl::RCReference<ifrt::LoadedHostCallback>>
       ifrt_loaded_host_callbacks;
+  // TODO(b/394595987): This check should be based on platform id, but older
+  // versions of Jax will fail since they pass ifrt::LoadedHostCallback instead
+  // of CpuCallbacks.
+  if (!host_callbacks.empty() && host_callbacks[0].name() != nullptr &&
+      absl::EqualsIgnoreCase(host_callbacks[0].name(), "ffi_capsule")) {
+    auto ffi_context = MakeFfiContext(host_callbacks);
+    return std::make_unique<ifrt::XlaCompileOptions>(
+        std::move(options), std::move(ifrt_loaded_host_callbacks),
+        std::move(ffi_context));
+  }
   ifrt_loaded_host_callbacks.reserve(host_callbacks.size());
   // Extract `ifrt::LoadedHostCallback`s from host callback capsules that were
-  // created by `PyClient::MakePythonCallbackUsingHostSendAndRecv()` or
-  // `PyClient::GetEmitPythonCallbackDescriptor()`.
+  // created by `PyClient::MakePythonCallbackUsingHostSendAndRecv()`.
   for (auto& host_callback : host_callbacks) {
     ifrt_loaded_host_callbacks.push_back(tsl::FormRef(
         static_cast<ifrt::LoadedHostCallback*>(host_callback.data())));
@@ -384,10 +418,19 @@ MakeIfrtDeserializeExecutableOptions(std::optional<CompileOptions> options,
                                      std::vector<nb::capsule> host_callbacks) {
   std::vector<tsl::RCReference<ifrt::LoadedHostCallback>>
       ifrt_loaded_host_callbacks;
+  // TODO(b/394595987): This check should be based on platform id, but older
+  // versions of Jax will fail since they pass ifrt::LoadedHostCallback instead
+  // of CpuCallbacks.
+  if (!host_callbacks.empty() && host_callbacks[0].name() != nullptr &&
+      absl::EqualsIgnoreCase(host_callbacks[0].name(), "ffi_capsule")) {
+    auto ffi_context = MakeFfiContext(host_callbacks);
+    return std::make_unique<ifrt::XlaDeserializeExecutableOptions>(
+        std::move(options), std::move(ifrt_loaded_host_callbacks),
+        std::move(ffi_context));
+  }
   ifrt_loaded_host_callbacks.reserve(host_callbacks.size());
   // Extract `ifrt::LoadedHostCallback`s from host callback capsules that were
-  // created by `PyClient::MakePythonCallbackUsingHostSendAndRecv()` or
-  // `PyClient::GetEmitPythonCallbackDescriptor()`.
+  // created by `PyClient::MakePythonCallbackUsingHostSendAndRecv()`.
   for (auto& host_callback : host_callbacks) {
     ifrt_loaded_host_callbacks.push_back(tsl::FormRef(
         static_cast<ifrt::LoadedHostCallback*>(host_callback.data())));
@@ -649,19 +692,21 @@ PyClient::GetEmitPythonCallbackDescriptor(
   return std::make_pair(descriptor, nb::object(std::move(callback_capsule)));
 }
 
-// TODO(b/394595987): Deprecate / clean up this API method to remove the need
-// for `operand_shapes` and `result_shapes` once we can remove
-// xla::PyClient::GetEmitPythonCallbackDescriptor (called by mlir.py's
-// get_emit_python_callback for CPU/GPU devices).
 absl::StatusOr<nb::object> PyClient::GetEmitPythonCallback(
     nb::callable callable) {
-  absl::Span<const Shape> operand_shapes;
-  absl::Span<const Shape> result_shapes;
-  TF_ASSIGN_OR_RETURN(auto descriptor_and_callback,
-                      GetEmitPythonCallbackDescriptor(
-                          std::move(callable), operand_shapes, result_shapes));
-  return nb::object(std::move(descriptor_and_callback.second));
+  auto platform_id = ifrt_client()->platform_id();
+  if (platform_id == CpuId() || platform_id == CudaId() ||
+      platform_id == RocmId() || platform_id == SyclId()) {
+    auto cb = tsl::MakeRef<RefCountedCpuCallback>(std::move(callable));
+    return nb::object(std::move(nb::capsule(cb.release(), "ffi_capsule")));
+  }
+  return absl::UnimplementedError(
+      "GetEmitPythonCallback is only implemented for CPU/GPU platforms.");
 }
+
+ffi::TypeId FfiLoadedHostCallbacks::id = {};
+XLA_FFI_REGISTER_TYPE(ffi::GetXlaFfiApi(), "ffi_loaded_host_callbacks",
+                      &FfiLoadedHostCallbacks::id);
 
 XLA_CPU_REGISTER_CUSTOM_CALL_TARGET_WITH_SYM("xla_python_cpu_callback",
                                              &XlaPythonCpuCallback);
