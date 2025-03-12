@@ -184,7 +184,9 @@ class Layout {
   Layout& operator=(const Layout& other);
   Layout& operator=(Layout&& other);
 
-  // Construct a shape from a LayoutProto.
+  // Creates a Layout from a LayoutProto. If the proto has logically invalid
+  // fields, this will return a Layout that will fail to validate, but will not
+  // crash.
   static Layout CreateFromProto(const LayoutProto& proto);
 
   // Returns a LayoutProto representation of the Layout.
@@ -383,9 +385,11 @@ class Layout {
   int64_t tail_padding_alignment_in_elements() const {
     return tail_padding_alignment_in_elements_;
   }
+
+  // Sets the tail_padding_alignment_in_elements value. If the value is less
+  // than 1, it will log a fatal error.
   Layout& set_tail_padding_alignment_in_elements(int64_t value) {
-    CHECK_GE(value, 1) << "tail_padding_alignment_in_elements must be >= 1";
-    tail_padding_alignment_in_elements_ = value;
+    set_tail_padding_alignment_in_elements(value, ActionOnError::kCheckFail);
     return *this;
   }
 
@@ -458,6 +462,12 @@ class Layout {
   }
 
  private:
+  // What to do if a method encounters an error.
+  enum class ActionOnError {
+    kCheckFail,
+    kWarning,
+  };
+
   // We store a single inlined vector to hold
   struct DimInfo {
     DimInfo()
@@ -467,6 +477,20 @@ class Layout {
     bool dim_unique : 1;
     bool dim_ordered : 1;
   };
+
+  // Sets the tail_padding_alignment_in_elements value. If the value is less
+  // than 1, it will log a warning or fatal error depending on the error action.
+  void set_tail_padding_alignment_in_elements(
+      const int64_t value, const ActionOnError error_action) {
+    if (value < 1) {
+      LOG(LEVEL(error_action == ActionOnError::kCheckFail ? tsl::FATAL
+                                                          : tsl::WARNING))
+          << "tail_padding_alignment_in_elements must be >= 1. Actual value: "
+          << value;
+    }
+    tail_padding_alignment_in_elements_ = value;
+  }
+
   absl::InlinedVector<DimInfo, InlineRank()> dim_attributes_;
 
   uint8_t n_dim_level_types_ = 0;
